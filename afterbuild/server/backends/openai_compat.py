@@ -52,3 +52,29 @@ def build_request(
         if params.repeat_last_n is not None:
             body["repeat_last_n"] = params.repeat_last_n
     return url, headers, body
+
+
+async def parse_sse_lines(lines: AsyncIterator[bytes]) -> AsyncIterator[str]:
+    """Yield content deltas from an OpenAI-style SSE byte stream."""
+    async for raw in lines:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise BackendError(f"Malformed SSE chunk: {data[:120]!r}") from exc
+        if "error" in chunk:
+            raise BackendError(f"Provider error: {str(chunk['error'])[:200]}")
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        if content:
+            yield content
