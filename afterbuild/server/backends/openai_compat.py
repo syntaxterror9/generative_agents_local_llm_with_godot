@@ -1,6 +1,7 @@
 """OpenAI-compatible Chat Completions client (llama-server, OpenRouter, DeepSeek)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -78,3 +79,72 @@ async def parse_sse_lines(lines: AsyncIterator[bytes]) -> AsyncIterator[str]:
         content = delta.get("content")
         if content:
             yield content
+
+
+class OpenAICompatBackend(Backend):
+    """SSE client for any OpenAI-compatible /chat/completions endpoint."""
+
+    def __init__(self, name: str, profile: Dict[str, Any], config: Dict[str, Any]):
+        self.name = name
+        self.profile = profile
+        self.config = config
+        self.model = str(profile.get("model", name))
+        self._session: aiohttp.ClientSession | None = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(
+                total=float(self.config.get("request_timeout_s", DEFAULT_TIMEOUT_S)),
+                connect=CONNECT_TIMEOUT_S,
+            )
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def stream_chat(
+        self, messages: List[ChatMessage], params: GenerationParams
+    ) -> AsyncIterator[str]:
+        url, headers, body = build_request(
+            self.profile, self.name, messages, params
+        )
+        session = self._get_session()
+        try:
+            async with session.post(url, json=body, headers=headers) as response:
+                if response.status != 200:
+                    text = (await response.text())[:200]
+                    raise BackendError(
+                        f"{self.name} returned HTTP {response.status}: {text}"
+                    )
+                async for content in parse_sse_lines(response.content):
+                    yield content
+        except aiohttp.ClientError as exc:
+            raise BackendError(f"{self.name} request failed: {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise BackendError(f"{self.name} request timed out") from exc
+
+    async def startup_check(self) -> None:
+        if self.name != "llamacpp":
+            return
+        base_url = str(self.profile["base_url"]).rstrip("/")
+        root = base_url[:-3] if base_url.endswith("/v1") else base_url
+        health_url = root + "/health"
+        try:
+            session = self._get_session()
+            async with session.get(
+                health_url, timeout=aiohttp.ClientTimeout(total=3)
+            ) as response:
+                if response.status == 200:
+                    logger.info("llama-server health OK at %s", health_url)
+                else:
+                    logger.warning(
+                        "llama-server health check: HTTP %s at %s",
+                        response.status, health_url,
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "llama-server not reachable at %s (%s); server will still start",
+                health_url, exc,
+            )
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
