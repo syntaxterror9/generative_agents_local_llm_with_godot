@@ -70,14 +70,18 @@ async def parse_sse_lines(lines: AsyncIterator[bytes]) -> AsyncIterator[str]:
             chunk = json.loads(data)
         except json.JSONDecodeError as exc:
             raise BackendError(f"Malformed SSE chunk: {data[:120]!r}") from exc
+        if not isinstance(chunk, dict):
+            raise BackendError(f"Malformed SSE chunk: {data[:120]!r}")
         if "error" in chunk:
             raise BackendError(f"Provider error: {str(chunk['error'])[:200]}")
         choices = chunk.get("choices") or []
-        if not choices:
+        if not choices or not isinstance(choices[0], dict):
             continue
-        delta = choices[0].get("delta") or {}
+        delta = choices[0].get("delta")
+        if not isinstance(delta, dict):
+            continue
         content = delta.get("content")
-        if content:
+        if isinstance(content, str) and content:
             yield content
 
 

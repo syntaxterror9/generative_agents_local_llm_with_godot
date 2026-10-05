@@ -58,3 +58,28 @@ async def test_malformed_json_raises():
 async def test_error_payload_chunk_raises():
     with pytest.raises(BackendError, match="Provider error"):
         await collect(b'data: {"error":{"message":"rate limited"}}\n')
+
+
+async def test_non_object_json_chunks_raise_backend_error():
+    for payload in (b"data: null\n", b"data: 42\n", b'data: ["x"]\n'):
+        with pytest.raises(BackendError, match="Malformed SSE chunk"):
+            await collect(payload)
+
+
+async def test_non_object_choice_is_skipped():
+    chunks = await collect(
+        b'data: {"choices":[null]}\n',
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+        b'data: [DONE]\n',
+    )
+    assert chunks == ["ok"]
+
+
+async def test_non_string_content_is_skipped():
+    chunks = await collect(
+        b'data: {"choices":[{"delta":{"content":42}}]}\n',
+        b'data: {"choices":[{"delta":null}]}\n',
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+        b'data: [DONE]\n',
+    )
+    assert chunks == ["ok"]

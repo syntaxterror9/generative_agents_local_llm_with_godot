@@ -443,7 +443,15 @@ class DialogueServer:
                     system_prompt += memory_text
 
             messages = [ChatMessage(role="system", content=system_prompt)]
-            for memory in self.memory_cache.get(npc_name, [])[-self.active_context_size:]:
+            # Only user conversations become replayed turns: NPC-to-NPC lines are
+            # stored under the listener and would otherwise be fed back to the
+            # model as if the user had said them. Legacy entries without the
+            # field are treated as user turns.
+            user_memories = [
+                memory for memory in self.memory_cache.get(npc_name, [])
+                if memory.get("interaction_type", "user_to_npc") == "user_to_npc"
+            ]
+            for memory in user_memories[-self.active_context_size:]:
                 user_input = memory.get("user_input", "")
                 response = memory.get("npc_response", "")
                 if user_input and response:
@@ -619,7 +627,7 @@ class DialogueServer:
             raw_response = await self.backend.chat(messages, self.decision_params())
         except BackendError as exc:
             logger.error(f"Decision backend error for {npc_name}: {exc}")
-            raw_response = ""
+            raw_response = "error"
 
         elapsed_time = time.time() - start_time
         

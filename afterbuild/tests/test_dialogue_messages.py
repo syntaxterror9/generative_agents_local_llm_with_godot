@@ -73,6 +73,24 @@ def test_memories_with_empty_sides_are_skipped(tmp_path):
     assert "kept" in turn_contents and "kept reply" in turn_contents
 
 
+def test_npc_to_npc_memories_are_not_replayed_as_user_turns(tmp_path):
+    server = make_server(tmp_path)
+    server.memory_cache["Leonardo"] = [
+        memory("user said this", "leonardo replied"),
+        {"user_input": "einstein said this", "npc_response": "leonardo answered",
+         "keywords": ["chat"], "speaker": "Einstein", "importance": 3.0,
+         "interaction_type": "npc_to_npc"},
+        {"user_input": "legacy entry", "npc_response": "legacy reply",
+         "keywords": ["chat"], "speaker": "user", "importance": 3.0},
+    ]
+    messages = server.build_dialogue_messages("Leonardo", "user", "next")
+    turn_contents = [m.content for m in messages[1:]]
+    assert "einstein said this" not in turn_contents
+    assert "leonardo answered" not in turn_contents
+    assert "user said this" in turn_contents
+    assert "legacy entry" in turn_contents  # entries without the field still replay
+
+
 def test_empty_memory_cache_still_produces_system_and_user(tmp_path):
     server = make_server(tmp_path)
     server.memory_cache["Leonardo"] = []
