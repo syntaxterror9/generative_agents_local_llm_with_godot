@@ -16,40 +16,53 @@ import re
 from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
-from gpt4all import GPT4All
-import nltk
-
-nltk.download('stopwords')
-from nltk.corpus import stopwords
-
-stop_words = set(stopwords.words('english'))
+from backends import (
+    Backend,
+    BackendError,
+    ChatMessage,
+    GenerationParams,
+    create_backend,
+)
 
 CLEAN_TEXT_PATTERN = re.compile(r'[^\w\s]')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+try:
+    import nltk
+
+    nltk.download('stopwords', quiet=True)
+    from nltk.corpus import stopwords as _nltk_stopwords
+
+    stop_words = set(_nltk_stopwords.words('english'))
+except Exception as _exc:  # offline first run etc. — keep serving with reduced list
+    logger.warning("nltk stopwords unavailable (%s); continuing with reduced stopword list", _exc)
+    stop_words = set()
+
 
 class DialogueServer:
     """Single server handling all dialogue functionality"""
     
-    def __init__(self, config_path: str = "config.json", decision_config_path: str = "decision_config.json"):
+    def __init__(
+        self,
+        config_path: str = "config.json",
+        decision_config_path: str = "decision_config.json",
+        memory_dir: str = "../npc_memories",
+        decision_log_dir: str = "../decision_logs",
+    ):
         """Initialize with configuration"""
         self.config = self.load_config(config_path)
         self.decision_config = self.load_decision_config(decision_config_path)
-        self.model = None
-        self.npc_sessions = {}  # Store chat sessions for each NPC
-        self.decision_sessions = {}  # Store decision sessions (separate from dialogue)
-        
-        # Step 1: Basic lock for model access
-        self.model_lock = asyncio.Lock()
-        
+        self.backend = create_backend(self.config)
+        self.active_context_size = int(self.config.get("active_context_size", 7))
+
         # Memory directory
-        self.memory_dir = Path("../npc_memories")
+        self.memory_dir = Path(memory_dir)
         self.memory_dir.mkdir(exist_ok=True)
-        
+
         # Decision log directory
-        self.decision_log_dir = Path("../decision_logs")
+        self.decision_log_dir = Path(decision_log_dir)
         self.decision_log_dir.mkdir(exist_ok=True)
         
         # Memory cache for faster access
@@ -129,9 +142,7 @@ class DialogueServer:
         else:
             # Default configuration
             default_config = {
-                "model_file": "Llama-3.2-3B-Instruct-Q4_0.gguf",
-                "model_path": "../../models/llms",
-                "device": "gpu",
+                "provider": "llamacpp",
                 "max_tokens": 150,
                 "temperature": 0.7,
                 "top_k": 40,
@@ -139,7 +150,9 @@ class DialogueServer:
                 "repeat_penalty": 1.18,
                 "repeat_last_n": 64,
                 "max_memory_entries": 20,
-                "websocket_port": 9999
+                "active_context_size": 7,
+                "request_timeout_s": 60,
+                "websocket_port": 9999,
             }
             with open(config_path, 'w') as f:
                 json.dump(default_config, f, indent=2)
@@ -376,7 +389,7 @@ class DialogueServer:
             'interaction_type': 'user_to_npc' if (from_speaker or '').lower() == 'user' else 'npc_to_npc',
             'metadata': {
                 'response_time': elapsed_time,
-                'model': self.config['model_file']
+                'model': f"{self.backend.name}:{self.backend.model}"
             }
         }
 
@@ -394,103 +407,27 @@ class DialogueServer:
         except Exception as e:
             logger.error(f"Failed to save memories for {npc_name}: {e}")
 
-    def load_model(self):
-        """Load GPT4All model"""
-        try:
-            current_dir = Path(__file__).parent
-            model_path = (current_dir / self.config["model_path"]).resolve()
-            model_file = self.config["model_file"]
-
-            logger.info(f"Loading model: {model_file} from {model_path}")
-
-            self.model = GPT4All(
-                model_name=model_file,
-                model_path=str(model_path),
-                device=self.config["device"],
-                verbose=False
-            )
-
-            logger.info(f"Model loaded successfully on {self.config['device']}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            return False
-
-    def get_or_create_session(self, npc_name: str, from_speaker: str = "user"):
-        """Get or create a chat session for an NPC dialogue
-        Sessions are unique per speaker-NPC pair to maintain separate contexts
-        """
-        npc_name = self.canonicalize_npc_name(npc_name)
-        
-        # Special case: system requests are for NPC to generate initial dialogue
+    def build_dialogue_messages(self, npc_name: str, from_speaker: str, user_message: str) -> List[ChatMessage]:
+        """Build the full stateless message list for one dialogue turn."""
         if from_speaker == "system":
-            # This is a request for the NPC to generate their own greeting
-            # The message contains the prompt for generation
-            session_key = f"{npc_name}_generation"
-            logger.info(f"Generation request for {npc_name}")
-        else:
-            # Create unique session key with consistent ordering
-            # Always use alphabetical ordering to ensure consistency
-            # This ensures Alice->Bob and Bob->Alice use the same session
-            # Also ensures user->Bob and Bob->user use the same session
-            participants = sorted([from_speaker, npc_name])
-            session_key = f"{participants[0]}<->{participants[1]}"
-            
-            logger.info(f"Session key: {session_key} (speaker: {from_speaker}, target: {npc_name})")
-        
-        if session_key not in self.npc_sessions:
-            # Create appropriate system prompt based on who is speaking
-            if from_speaker == "system":
-                # For generation requests, use the message as the system prompt
-                system_prompt = ""  # Will be set from the message
-            elif from_speaker == "user":
-                # User talking to NPC - standard prompts
-                prompts = {
-                    "Leonardo": "You are Leonardo da Vinci, Renaissance genius bartender.\nSpeak with curiosity about art, science, and inventions.\nReply with ONE short sentence only.",
-                    "Einstein": "You are Albert Einstein, brilliant physicist contemplating in a bar.\nSpeak with gentle humor about relativity and the universe.\nReply with ONE short sentence only.",
-                    "Shakespeare": "You are William Shakespeare, the great playwright.\nSpeak dramatically and poetically, with theatrical flair.\nReply with ONE short sentence only.",
-                    "Socrates": "You are Socrates, the ancient philosopher as a wise dog.\nAsk thought-provoking questions with barks of wisdom.\nReply with ONE short sentence only."
-                }
-            else:
-                # NPC talking to another NPC - relationship-aware prompts
-                # Define relationships
-                relationships = {
-                    ("Einstein", "Leonardo"): "Leonardo, the Renaissance master",
-                    ("Leonardo", "Einstein"): "Einstein, the modern genius",
-                    ("Shakespeare", "Leonardo"): "Leonardo, the artistic soul",
-                    ("Leonardo", "Shakespeare"): "Shakespeare, the wordsmith",
-                    ("Einstein", "Shakespeare"): "Shakespeare, the dramatic poet",
-                    ("Shakespeare", "Einstein"): "Einstein, the cosmic thinker",
-                    ("Socrates", "Leonardo"): "Leonardo, the polymath",
-                    ("Leonardo", "Socrates"): "Socrates, the wise hound",
-                    ("Socrates", "Einstein"): "Einstein, the truth seeker",
-                    ("Einstein", "Socrates"): "Socrates, the philosopher dog",
-                    ("Socrates", "Shakespeare"): "Shakespeare, the bard",
-                    ("Shakespeare", "Socrates"): "Socrates, the questioning canine"
-                }
-                
-                # Get appropriate description
-                speaker_desc = relationships.get((from_speaker, npc_name), from_speaker)
-                
-                prompts = {
-                    "Leonardo": f"You are Leonardo da Vinci. {speaker_desc} is talking to you.\nRespond with Renaissance curiosity and artistic insight.\nReply with ONE short sentence only.",
-                    "Einstein": f"You are Albert Einstein. {speaker_desc} is talking to you.\nRespond with scientific wonder and gentle humor.\nReply with ONE short sentence only.",
-                    "Shakespeare": f"You are William Shakespeare. {speaker_desc} is talking to you.\nRespond dramatically with poetic flair.\nReply with ONE short sentence only.",
-                    "Socrates": f"You are Socrates, a philosopher in dog form. {speaker_desc} is talking to you.\nRespond with wisdom or a thought-provoking question.\nReply with ONE short sentence only."
-                }
-            
-            system_prompt = prompts.get(npc_name, f"You are {npc_name}. {from_speaker} is talking to you. Reply with ONE short sentences only.")
-            
-            # Add memory context to system prompt
-            if npc_name in self.memory_cache and len(self.memory_cache[npc_name]) > 0:
-                relevant_memories = self.retrieve_relevant_memories(
-                    npc_name,
-                    from_speaker,
-                    speaker=from_speaker,
-                    k=5
-                )
+            return [
+                ChatMessage(role="system", content=user_message),
+                ChatMessage(role="user", content="Start a conversation."),
+            ]
 
+        if from_speaker == "user":
+            prompts = {
+                "Leonardo": "You are Leonardo da Vinci, Renaissance genius bartender.\nSpeak with curiosity about art, science, and inventions.\nReply with ONE short sentence only.",
+                "Einstein": "You are Albert Einstein, brilliant physicist contemplating in a bar.\nSpeak with gentle humor about relativity and the universe.\nReply with ONE short sentence only.",
+                "Shakespeare": "You are William Shakespeare, the great playwright.\nSpeak dramatically and poetically, with theatrical flair.\nReply with ONE short sentence only.",
+                "Socrates": "You are Socrates, the ancient philosopher as a wise dog.\nAsk thought-provoking questions with barks of wisdom.\nReply with ONE short sentence only."
+            }
+            system_prompt = prompts.get(npc_name, f"You are {npc_name}. {from_speaker} is talking to you. Reply with ONE short sentences only.")
+
+            if self.memory_cache.get(npc_name):
+                relevant_memories = self.retrieve_relevant_memories(
+                    npc_name, from_speaker, speaker=from_speaker, k=5
+                )
                 if relevant_memories:
                     memory_text = "\n\nMost relevant memories:\n"
                     for memory in relevant_memories:
@@ -504,44 +441,66 @@ class DialogueServer:
                             f"  You: {memory.get('npc_response', '')[:50]}...\n"
                         )
                     system_prompt += memory_text
-            
-            
-            # Create chat session
-            session_context = self.model.chat_session(system_prompt=system_prompt)
-            session = session_context.__enter__()
-            
-            self.npc_sessions[session_key] = {
-                "session": session,
-                "session_context": session_context,
-                "system_prompt": system_prompt
-            }
-            
-            logger.info(f"Created session for {session_key}")
-        
-        return self.npc_sessions[session_key]
-    
-    def get_or_create_decision_session(self, npc_name: str):
-        """Get or create a decision-only session (separate from dialogue)"""
-        session_key = f"{npc_name}_decision"
-        
-        if session_key not in self.decision_sessions:
-            # Get system prompt from config
-            system_prompt = self.decision_config["system_prompts"]["strict"]
-            
-            # Create new independent session
-            session_context = self.model.chat_session(system_prompt=system_prompt)
-            session = session_context.__enter__()
-            
-            self.decision_sessions[session_key] = {
-                "session": session,
-                "session_context": session_context,
-                "system_prompt": system_prompt
-            }
-            
-            logger.info(f"Created decision session for {npc_name}")
-        
-        return self.decision_sessions[session_key]["session"]
-    
+
+            messages = [ChatMessage(role="system", content=system_prompt)]
+            for memory in self.memory_cache.get(npc_name, [])[-self.active_context_size:]:
+                user_input = memory.get("user_input", "")
+                response = memory.get("npc_response", "")
+                if user_input and response:
+                    messages.append(ChatMessage(role="user", content=user_input))
+                    messages.append(ChatMessage(role="assistant", content=response))
+            messages.append(ChatMessage(role="user", content=user_message))
+            return messages
+
+        # NPC-to-NPC: relationship-aware prompt, no history (matches previous fresh-session behavior).
+        # This dict is copied verbatim from the live handle_websocket path: key is
+        # (speaker, listener) and the value names the SPEAKER.
+        relationships = {
+            ("Einstein", "Leonardo"): "Einstein, the modern genius",
+            ("Leonardo", "Einstein"): "Leonardo, the Renaissance master",
+            ("Shakespeare", "Leonardo"): "Shakespeare, the wordsmith",
+            ("Leonardo", "Shakespeare"): "Leonardo, the artistic soul",
+            ("Einstein", "Shakespeare"): "Einstein, the cosmic thinker",
+            ("Shakespeare", "Einstein"): "Shakespeare, the dramatic poet",
+            ("Socrates", "Leonardo"): "Socrates, the philosopher dog",
+            ("Leonardo", "Socrates"): "Leonardo, the polymath",
+            ("Socrates", "Einstein"): "Socrates, the wise hound",
+            ("Einstein", "Socrates"): "Einstein, the truth seeker",
+            ("Socrates", "Shakespeare"): "Socrates, the questioning canine",
+            ("Shakespeare", "Socrates"): "Shakespeare, the bard"
+        }
+        speaker_desc = relationships.get((from_speaker, npc_name), from_speaker)
+        prompts = {
+            "Leonardo": f"You are Leonardo da Vinci. {speaker_desc} is talking to you.\nRespond with Renaissance curiosity and artistic insight.\nReply with ONE short sentence only.",
+            "Einstein": f"You are Albert Einstein. {speaker_desc} is talking to you.\nRespond with scientific wonder and gentle humor.\nReply with ONE short sentence only.",
+            "Shakespeare": f"You are William Shakespeare. {speaker_desc} is talking to you.\nRespond dramatically with poetic flair.\nReply with ONE short sentence only.",
+            "Socrates": f"You are Socrates, a philosopher in dog form. {speaker_desc} is talking to you.\nRespond with wisdom or a thought-provoking question.\nReply with ONE short sentence only."
+        }
+        system_prompt = prompts.get(npc_name, f"You are {npc_name}. Reply with ONE short sentence only.")
+        return [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=user_message),
+        ]
+
+    def dialogue_params(self) -> GenerationParams:
+        return GenerationParams(
+            max_tokens=self.config["max_tokens"],
+            temperature=self.config["temperature"],
+            top_p=self.config["top_p"],
+            top_k=self.config.get("top_k"),
+            repeat_penalty=self.config.get("repeat_penalty"),
+            repeat_last_n=self.config.get("repeat_last_n"),
+        )
+
+    def decision_params(self) -> GenerationParams:
+        gen = self.decision_config["generation_params"]
+        return GenerationParams(
+            max_tokens=gen["max_tokens"],
+            temperature=gen["temperature"],
+            top_p=gen["top_p"],
+            top_k=gen.get("top_k"),
+        )
+
     def process_decision_output(self, raw_response: str, valid_actions: List[str]) -> str:
         """Process LLM output to extract valid action"""
         # Clean the output
@@ -602,7 +561,7 @@ class DialogueServer:
         # Console output for real-time debugging
         logger.info(f"[DECISION] {npc_name}: '{log_entry['raw_response']}' -> {log_entry['processed_action']} (valid: {log_entry['valid']})")
     
-    def make_simple_decision(self, npc_name: str, context: str) -> Dict:
+    async def make_simple_decision(self, npc_name: str, context: str) -> Dict:
         """Action with target decision (stateless)"""
         
         # Create fresh session for each decision (stateless)
@@ -649,24 +608,19 @@ class DialogueServer:
         if examples:
             prompt = f"{prompt}\n{examples}"
         
-        # Get generation parameters
-        gen_params = level_config["generation_params"]
-        
         # Record start time
         start_time = time.time()
-        
-        # Generate response using stateless chat session
-        # Each request creates a new session context
-        with self.model.chat_session(system_prompt=system_prompt) as session:
-            raw_response = session.generate(
-                prompt,
-                max_tokens=gen_params["max_tokens"],
-                temp=gen_params["temperature"],
-                top_k=gen_params["top_k"],
-                top_p=gen_params["top_p"],
-                streaming=False
-            )
-        
+
+        messages = [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=prompt),
+        ]
+        try:
+            raw_response = await self.backend.chat(messages, self.decision_params())
+        except BackendError as exc:
+            logger.error(f"Decision backend error for {npc_name}: {exc}")
+            raw_response = ""
+
         elapsed_time = time.time() - start_time
         
         # Process output
@@ -798,19 +752,11 @@ class DialogueServer:
                         
                         logger.info(f"[DECISION REQUEST] {npc_name}: {context}")
                         
-                        # Use lock to prevent concurrent model access
-                        async with self.model_lock:
-                            logger.info(f"[LOCK] {npc_name} decision acquired lock")
-                            try:
-                                # Make decision - this uses the model
-                                result = self.make_simple_decision(npc_name, context)
-                                logger.info(f"[LOCK] {npc_name} decision completed")
-                            except Exception as e:
-                                logger.error(f"[LOCK] {npc_name} decision failed: {e}")
-                                result = {"action": "idle", "target": "self", "raw": "error", "time": 0, "valid": False}
-                            # Lock automatically released here after try/except
-                        
-                        logger.info(f"[LOCK] {npc_name} decision lock released")
+                        try:
+                            result = await self.make_simple_decision(npc_name, context)
+                        except Exception as e:
+                            logger.error(f"{npc_name} decision failed: {e}")
+                            result = {"action": "idle", "target": "self", "raw": "error", "time": 0, "valid": False}
                         
                         # Send response (outside lock - doesn't use model)
                         await websocket.send(json.dumps({
@@ -844,113 +790,41 @@ class DialogueServer:
                     
                     logger.info(f"[{npc_name}] Received from {from_speaker}: {user_message}")
                     
-                    # Use lock for entire dialogue generation
-                    start_time = time.time()  # Move start_time outside try block
-                    async with self.model_lock:
-                        logger.info(f"[LOCK] {npc_name} dialogue acquired lock")
-                        try:
-                            # Special handling for system requests (NPC generating their own greeting)
-                            if from_speaker == "system":
-                                # Use the message as the prompt directly
-                                system_prompt = user_message
-                                # Create a temporary session for generation
-                                session_context = self.model.chat_session(system_prompt=system_prompt)
-                                session = session_context.__enter__()
-                                prompt = "Start a conversation."  # Clear prompt to trigger generation
-                            else:
-                                # Normal dialogue handling
-                                # For NPC-to-NPC dialogue, always create a fresh session to maintain proper prompts
-                                if from_speaker != "user":
-                                    # Create temporary session for NPC-to-NPC dialogue
-                                    relationships = {
-                                        ("Einstein", "Leonardo"): "Einstein, the modern genius",
-                                        ("Leonardo", "Einstein"): "Leonardo, the Renaissance master",
-                                        ("Shakespeare", "Leonardo"): "Shakespeare, the wordsmith",
-                                        ("Leonardo", "Shakespeare"): "Leonardo, the artistic soul",
-                                        ("Einstein", "Shakespeare"): "Einstein, the cosmic thinker",
-                                        ("Shakespeare", "Einstein"): "Shakespeare, the dramatic poet",
-                                        ("Socrates", "Leonardo"): "Socrates, the philosopher dog",
-                                        ("Leonardo", "Socrates"): "Leonardo, the polymath",
-                                        ("Socrates", "Einstein"): "Socrates, the wise hound",
-                                        ("Einstein", "Socrates"): "Einstein, the truth seeker",
-                                        ("Socrates", "Shakespeare"): "Socrates, the questioning canine",
-                                        ("Shakespeare", "Socrates"): "Shakespeare, the bard"
-                                    }
-                                    speaker_desc = relationships.get((from_speaker, npc_name), from_speaker)
-                                    
-                                    prompts = {
-                                        "Leonardo": f"You are Leonardo da Vinci. {speaker_desc} is talking to you.\nRespond with Renaissance curiosity and artistic insight.\nReply with ONE short sentence only.",
-                                        "Einstein": f"You are Albert Einstein. {speaker_desc} is talking to you.\nRespond with scientific wonder and gentle humor.\nReply with ONE short sentence only.",
-                                        "Shakespeare": f"You are William Shakespeare. {speaker_desc} is talking to you.\nRespond dramatically with poetic flair.\nReply with ONE short sentence only.",
-                                        "Socrates": f"You are Socrates, a philosopher in dog form. {speaker_desc} is talking to you.\nRespond with wisdom or a thought-provoking question.\nReply with ONE short sentence only."
-                                    }
-                                    system_prompt = prompts.get(npc_name, f"You are {npc_name}. Reply with ONE short sentence only.")
-                                    
-                                    session_context = self.model.chat_session(system_prompt=system_prompt)
-                                    session = session_context.__enter__()
-                                    prompt = user_message
-                                else:
-                                    # User dialogue - use persistent session
-                                    npc_data = self.get_or_create_session(npc_name, from_speaker)
-                                    session = npc_data["session"]
-                                    prompt = user_message
-                            
-                            # Generate response with streaming
-                            full_response = ""
-                            
-                            # Debug: Log the prompt being sent
-                            logger.info(f"[DEBUG] Sending prompt to {npc_name}: '{prompt[:100]}...' (length: {len(prompt)})")
-                            
-                            for token in session.generate(
-                                prompt,
-                                max_tokens=self.config["max_tokens"],
-                                temp=self.config["temperature"],
-                                top_k=self.config["top_k"],
-                                top_p=self.config["top_p"],
-                                repeat_penalty=self.config["repeat_penalty"],
-                                repeat_last_n=self.config["repeat_last_n"],
-                                streaming=True
-                            ):
-                                # Send each token (still inside lock to ensure generation completes)
-                                await websocket.send(json.dumps({
-                                    "type": "token",
-                                    "content": token,
-                                    "npc": npc_name
-                                }))
-                                full_response += token
-                                await asyncio.sleep(0.02)  # Small delay for smooth streaming
-                            
-                            # Debug: Log the generated response
-                            logger.info(f"[DEBUG] {npc_name} generated: '{full_response[:100]}...' (length: {len(full_response)})")
-                            logger.info(f"[LOCK] {npc_name} dialogue completed")
-                            
-                            # Clean up temporary sessions
-                            if 'session_context' in locals() and (from_speaker == "system" or (from_speaker != "user" and from_speaker != "system")):
-                                session_context.__exit__(None, None, None)
-                                
-                        except Exception as e:
-                            logger.error(f"[LOCK] {npc_name} dialogue failed: {e}")
-                            full_response = "Sorry, I'm having trouble responding right now."
-                            # Clean up temporary session if it exists
-                            if from_speaker == "system" and 'session_context' in locals():
-                                session_context.__exit__(None, None, None)
-                        # Lock automatically released here
-                    
-                    logger.info(f"[LOCK] {npc_name} dialogue lock released")
-                    
-                    # Send completion signal (outside lock - doesn't use model)
+                    start_time = time.time()
+                    full_response = ""
+                    try:
+                        messages = self.build_dialogue_messages(npc_name, from_speaker, user_message)
+                        logger.info(f"[{npc_name}] Sending {len(messages)} messages via {self.backend.name}")
+                        async for token in self.backend.stream_chat(messages, self.dialogue_params()):
+                            await websocket.send(json.dumps({
+                                "type": "token",
+                                "content": token,
+                                "npc": npc_name
+                            }))
+                            full_response += token
+                            await asyncio.sleep(0.02)  # pacing for the Godot client
+                    except BackendError as exc:
+                        logger.error(f"[{npc_name}] Backend error: {exc}")
+                        await websocket.send(json.dumps({"type": "error", "content": str(exc)}))
+                    except Exception as exc:
+                        logger.error(f"[{npc_name}] Dialogue failed: {exc}")
+                        await websocket.send(json.dumps({"type": "error", "content": str(exc)}))
+
+                    final_text = full_response.strip() or "Sorry, I'm having trouble responding right now."
+
+                    # Send completion signal
                     await websocket.send(json.dumps({
                         "type": "complete",
-                        "content": full_response.strip(),
+                        "content": final_text,
                         "npc": npc_name,
                         "from": from_speaker  # Include who initiated the dialogue
                     }))
-                    
+
                     # Save to memory (but not for system-generated greetings)
                     elapsed_time = time.time() - start_time
                     if from_speaker != "system":
-                        self.save_memory(npc_name, user_message, full_response.strip(), elapsed_time, from_speaker=from_speaker)
-                    
+                        self.save_memory(npc_name, user_message, final_text, elapsed_time, from_speaker=from_speaker)
+
                     logger.info(f"[{npc_name}] Response in {elapsed_time:.2f}s")
                     
                 except json.JSONDecodeError as e:
@@ -972,39 +846,18 @@ class DialogueServer:
             logger.error(f"WebSocket error: {e}")
     
     def cleanup(self):
-        """Clean up resources"""
-        # Close all chat sessions
-        for npc_name, npc_data in self.npc_sessions.items():
-            try:
-                session_context = npc_data.get("session_context")
-                if session_context:
-                    session_context.__exit__(None, None, None)
-                logger.info(f"Closed dialogue session for {npc_name}")
-            except Exception as e:
-                logger.error(f"Error closing dialogue session for {npc_name}: {e}")
-        
-        # Close all decision sessions
-        for session_key, session_data in self.decision_sessions.items():
-            try:
-                session_context = session_data.get("session_context")
-                if session_context:
-                    session_context.__exit__(None, None, None)
-                logger.info(f"Closed decision session for {session_key}")
-            except Exception as e:
-                logger.error(f"Error closing decision session for {session_key}: {e}")
-    
+        """Nothing persistent to close; memories are written on each interaction."""
+
     async def start_server(self):
         """Start WebSocket server"""
-        if not self.load_model():
-            return
-        
+        await self.backend.startup_check()
+
         port = self.config.get("websocket_port", 9999)
         
         print("\n" + "="*60)
         print("DIALOGUE & DECISION SERVER")
         print("="*60)
-        print(f"Model: {self.config['model_file']}")
-        print(f"Device: {self.config['device'].upper()}")
+        print(f"Provider: {self.backend.name} ({self.backend.model})")
         print(f"WebSocket Port: {port}")
         print(f"Decision Format: action|target")
         if "valid_actions" in self.decision_config:
@@ -1013,8 +866,11 @@ class DialogueServer:
         print("Waiting for connections...")
         print("Message types: 'dialogue' (default) or 'decision'\n")
         
-        async with websockets.serve(self.handle_websocket, "127.0.0.1", port):
-            await asyncio.Future()  # Run forever
+        try:
+            async with websockets.serve(self.handle_websocket, "127.0.0.1", port):
+                await asyncio.Future()  # Run forever
+        finally:
+            await self.backend.close()
     
     def run(self):
         """Main entry point"""
